@@ -11,13 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import (QEasingCurve, QObject, QPoint, QPointF, QRectF, QRunnable, Qt,
+from PySide6.QtCore import (QEasingCurve, QObject, QPoint, QPointF, QRectF, QRunnable, QSizeF, Qt,
                             QThreadPool, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QCursor, QFont, QGuiApplication, QImage, QPainter,
-                           QPainterPath, QPen, QPixmap, QRadialGradient)
+                           QPainterPath, QPen, QPixmap, QRadialGradient, QRegion)
 from PySide6.QtWidgets import QWidget
 
-from . import glass
+from . import glass, layershell
 from .util import resolve_shortcuts, ui_family
 
 
@@ -134,8 +134,112 @@ class RadialMenu(QWidget):
         self.hub_timer = QTimer(self, singleShot=True, interval=420, timeout=self.next_ring)
         self.frame = QTimer(self, interval=16, timeout=self._tick)   # 60 fps springs
 
+        # Wayland: one full-screen layer-shell overlay for the whole session. A surface that
+        # appears mid-drag never receives the drop, so the menu is never hidden — it "parks"
+        # with a 1-px input region and opens by widening it. The menu is drawn at `origin`
+        # (top-left of the usual SIZE box), taken from where the drag first enters.
+        self.layer = None
+        self.active = False
+        self.origin: QPointF | None = None
+        self.no_drag_timer = QTimer(self, singleShot=True, interval=3000, timeout=self._no_drag)
+        if sys.platform.startswith("linux"):
+            if layershell.available():
+                self.layer = layershell.LayerWindow(self)
+                self._park()
+                self.show()
+
+    def is_open(self) -> bool:
+        return self.active if self.layer else self.isVisible()
+
+    def _park(self, why: str = "picked"):
+        if self.active:
+            print(f"menu: parked ({why})", flush=True)
+        self.active = False
+        self.origin = None
+        self.frame.stop()
+        self.hub_timer.stop()
+        self.no_drag_timer.stop()
+        # erase first, then shrink: Qt clips painting to the mask, so an update() after
+        # setMask() would clear only that one pixel and leave the menu frozen on screen
+        self.repaint()
+        self.setMask(QRegion(0, 0, 1, 1))
+        self.layer.set_keyboard(layershell.KBD_NONE)
+        # the input region is double-buffered state: it only applies on the next commit.
+        # A parked menu never paints again, so without this repaint the old full-screen
+        # region stays live — an invisible surface that swallows every click on the output
+        self.repaint(0, 0, 1, 1)
+
+    def _vanish(self):
+        """Leave the screen after a pick: park on Wayland, hide elsewhere."""
+        if self.layer:
+            self._park()
+        else:
+            self.hide()
+
+    def update(self, *args):
+        """Wayland: the surface is full-screen, but only the menu box ever changes —
+        repainting a 3440×1440 surface at 60 fps for a 400-px menu burns a CPU core."""
+        if self.layer and not args and self.active and self.origin is not None:
+            return super().update(QRectF(self.origin, QSizeF(SIZE, SIZE)).toAlignedRect())
+        return super().update(*args)
+
+    def _no_drag(self):
+        # opened by the trigger, but no file arrived: whatever was held wasn't a file drag
+        if self.active and not self.click_mode and not self.got_drag:
+            self._park("no drag arrived")
+            self.dismissed.emit()
+
+    def mousePressEvent(self, e):
+        # a real drag never presses buttons on the drop target, so a press while open in drag
+        # mode means the menu is up without a drag — get out of the way instead of eating clicks
+        if self.layer and self.active and not self.click_mode:
+            self._park("click without a drag")
+            self.dismissed.emit()
+
+    def _local(self, pos: QPointF) -> QPointF:
+        """Event position → menu coordinates. On Wayland the first event places the menu."""
+        if not self.layer:
+            return pos
+        if self.origin is None:
+            g = self.rect()
+            half = SIZE / 2
+            x = min(max(pos.x(), half), g.width() - half)
+            y = min(max(pos.y(), half), g.height() - half)
+            self.origin = QPointF(x - half, y - half)
+            self.update()
+        return pos - self.origin
+
+    def _popup_layer(self, paths: list[str] | None):
+        self.backdrop = None                # no screen capture on Wayland: fallback glass
+        self._raw_backdrop = None
+        self.liquid = {}
+        self.hover = -1
+        self.got_drag = False
+        self.hub_armed = False
+        self.click_mode = paths is not None
+        if paths is not None:
+            self._load(paths)
+            # opened from tray / Send To: no drag to place it, start at the screen centre
+            self._local(QPointF(self.width() / 2, self.height() / 2))
+        else:
+            self.paths, self.rings, self.ring_names = [], {}, []
+            self.hub_text = "Drop here"
+        self.active = True
+        print(f"menu: open ({'click' if self.click_mode else 'drag'} mode)", flush=True)
+        self.clearMask()                    # catch the drag (or clicks) anywhere on screen
+        if self.click_mode:
+            self.layer.set_keyboard(layershell.KBD_EXCLUSIVE)   # Esc / Tab / Shift
+        else:
+            self.no_drag_timer.start()
+        self._t = 0.0
+        self.anim.start()
+        self.frame.start()
+        self.update()
+
     # ------------------------------------------------------------ show / hide
     def popup(self, pos: QPoint | None = None, paths: list[str] | None = None):
+        if self.layer:
+            return self._popup_layer(paths)
         pos = pos or QCursor.pos()
         tl = pos - QPoint(SIZE // 2, SIZE // 2)
         scr = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
@@ -215,6 +319,11 @@ class RadialMenu(QWidget):
             QTimer.singleShot(0, self.grabMouse)
 
     def close_menu(self):
+        if self.layer:
+            if self.active:
+                self._park("closed")
+                self.dismissed.emit()
+            return
         if self.isVisible():
             self.hide()
             self.frame.stop()
@@ -367,7 +476,8 @@ class RadialMenu(QWidget):
         e.accept()
 
     def dragMoveEvent(self, e):
-        self._set_hover(self.hit(e.position()), e.position())
+        pos = self._local(e.position())
+        self._set_hover(self.hit(pos), pos)
         e.setDropAction(Qt.CopyAction)
         e.accept()
 
@@ -375,13 +485,13 @@ class RadialMenu(QWidget):
         self._set_hover(-1)
 
     def dropEvent(self, e):
-        idx = self.hit(e.position())
+        idx = self.hit(self._local(e.position()))
         items = self.items
         if 0 <= idx < len(items):
             e.setDropAction(Qt.CopyAction)
             e.accept()
             item, paths = items[idx], list(self.paths)
-            self.hide()
+            self._vanish()
             # return to Explorer's drag loop immediately; do the work after
             QTimer.singleShot(0, lambda: self.activated.emit(item, paths))
         else:
@@ -391,7 +501,8 @@ class RadialMenu(QWidget):
     # ------------------------------------------------------------ click mode
     def mouseMoveEvent(self, e):
         if self.click_mode:
-            self._set_hover(self.hit(e.position()), e.position())
+            pos = self._local(e.position())
+            self._set_hover(self.hit(pos), pos)
 
     def mouseReleaseEvent(self, e):
         if not self.click_mode:
@@ -399,12 +510,12 @@ class RadialMenu(QWidget):
         if e.button() == Qt.RightButton:
             self.close_menu()
             return
-        idx = self.hit(e.position())
+        idx = self.hit(self._local(e.position()))
         if idx == -2:
             self.next_ring()
         elif 0 <= idx < len(self.items):
             item, paths = self.items[idx], list(self.paths)
-            self.hide()
+            self._vanish()
             QTimer.singleShot(0, lambda: self.activated.emit(item, paths))
         else:
             self.close_menu()
@@ -426,7 +537,11 @@ class RadialMenu(QWidget):
         return QColor(255, 255, 255), QColor(255, 255, 255, 190), QColor(0, 0, 0, 110)
 
     def paintEvent(self, e):
+        if self.layer and (not self.active or self.origin is None):
+            return                          # parked, or open but the drag hasn't arrived yet
         p = QPainter(self)
+        if self.layer:
+            p.translate(self.origin)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)

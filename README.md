@@ -33,7 +33,38 @@ sudo apt install ./DragShift-linux-amd64.deb
 
 Open **DragShift** from the app menu. It sits in the panel's notification area, and you can turn on *Start at login* in Settings. It works in Thunar, Nautilus, Nemo, Caja, Dolphin and on the desktop, and it also adds **Open With → DragShift** to file right-click menus. It works with or without a compositor: when compositing is off (common on XFCE), the menu and windows are cut to their exact shape, so you won't see black boxes. Builds target Debian 12 or newer (Ubuntu 23.04+).
 
-> **Wayland:** Wayland doesn't let apps read the global Shift and mouse state, so the Shift + drag trigger only works in X11 sessions (XFCE is X11). On GNOME/KDE Wayland, use right-click → **Open With → DragShift**, or pick *"Ubuntu on Xorg"* / *"Plasma (X11)"* at the login screen.
+### Wayland (this fork)
+
+The Shift + drag trigger works on Wayland too. Tested on **niri**; it should work on any compositor with `wlr-layer-shell` (Hyprland, Sway, KDE Plasma). GNOME's Mutter has no layer-shell, so there only **Open With → DragShift** works.
+
+1. Install the system Qt bindings and the layer-shell plugin. They must come from your distro, not pip: pip's PySide6 bundles its own Qt, which layer-shell-qt can't load into.
+   ```bash
+   # Arch / CachyOS
+   sudo pacman -S pyside6 layer-shell-qt python-evdev python-pillow python-pymupdf python-docx python-pillow-heif
+   ```
+2. Let DragShift read input devices, then log out and back in:
+   ```bash
+   sudo usermod -aG input $USER
+   ```
+3. Run from source: `python3 -m dragshift`
+
+How it works: Wayland gives apps no global mouse/keyboard state, so the trigger reads `/dev/input` with python-evdev (`platform_wayland.py`). The radial menu and the toasts become layer-shell overlays through layer-shell-qt's C++ API, called with ctypes (`layershell.py`). A compositor only routes a drag to surfaces that existed when the drag started, so the menu is never hidden. It *parks*: a full-screen transparent surface whose input region shrinks to 1 px, widening when you press Shift.
+
+Known limits: touchpad **tap-and-drag** is synthesised by libinput above evdev and isn't seen. Drag with a physical click instead. The menu draws its fallback glass, because Wayland apps can't capture the screen behind them.
+
+<details>
+<summary><b>По-русски</b></summary>
+
+Жест Shift + перетаскивание работает и в Wayland. Проверено в **niri**; должно работать в любом compositor с `wlr-layer-shell` (Hyprland, Sway, KDE Plasma). В GNOME (Mutter) layer-shell нет, там работает только **Открыть с помощью → DragShift**.
+
+1. Поставьте системные PySide6 и плагин layer-shell-qt. Именно из репозитория дистрибутива, не из pip: pip-версия PySide6 везёт свою копию Qt, к которой плагин не подключится (команда для Arch — выше).
+2. Дайте доступ к устройствам ввода и перезайдите в сессию: `sudo usermod -aG input $USER`.
+3. Запуск: `python3 -m dragshift`.
+
+Как устроено: в Wayland приложения не видят глобальное состояние мыши и клавиатуры, поэтому триггер читает `/dev/input` через python-evdev. Колесо и уведомления — layer-shell оверлеи (C++ API layer-shell-qt вызывается через ctypes). Compositor отдаёт перетаскивание только поверхностям, существовавшим к его началу, поэтому колесо не прячется, а «паркуется»: прозрачная поверхность на весь экран, у которой область ввода сжата до 1 пикселя и расширяется по Shift.
+
+Ограничения: **тап-перетаскивание** на тачпаде синтезирует libinput выше evdev, его не видно — перетаскивайте с физическим нажатием. Стеклянный фон колеса упрощённый: в Wayland приложение не может снять экран под собой.
+</details>
 
 > **First launch on Windows:** SmartScreen may warn because the app isn't code-signed yet. Click **More info → Run anyway**.
 >

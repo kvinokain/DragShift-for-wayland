@@ -39,9 +39,14 @@ class DragShiftWatcher(QObject):
             from . import platform_mac
             self._mac = platform_mac if platform_mac.OK else None
         elif sys.platform.startswith("linux"):
-            from . import platform_linux
-            # same interface as platform_mac: left_button_down / key_down / escape_down
-            self._mac = platform_linux if platform_linux.available() else None
+            from . import platform_linux, platform_wayland
+            # same interface as platform_mac: left_button_down / key_down / escape_down.
+            # Wayland first: under XWayland platform_linux would load too, but X11 only sees
+            # the pointer over X clients, so a drag from a Wayland file manager is invisible
+            if platform_wayland.is_wayland():
+                self._mac = platform_wayland if platform_wayland.available() else None
+            else:
+                self._mac = platform_linux if platform_linux.available() else None
         self.timer = QTimer(self, interval=15, timeout=self._tick)
 
     def set_key(self, name: str):
@@ -62,9 +67,15 @@ class DragShiftWatcher(QObject):
             return m.left_button_down(), m.key_down(self.key_name), m.escape_down()
         return self._down(VK_LBUTTON), self._down(self.vk), self._down(VK_ESCAPE)
 
+    def _pos(self) -> QPoint:
+        # Wayland: QCursor.pos() is stale, only evdev knows how far the pointer travelled
+        if hasattr(self._mac, "pointer_pos"):
+            return QPoint(*self._mac.pointer_pos())
+        return QCursor.pos()
+
     def _tick(self):
         lbtn, shift, esc = self._state()
-        pos = QCursor.pos()
+        pos = self._pos()
 
         if self.menu_visible():
             if not lbtn or esc:

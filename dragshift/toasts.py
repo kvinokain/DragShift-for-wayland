@@ -39,6 +39,14 @@ def reveal(path: str | Path):
 
 
 def open_file(path: str | Path):
+    if sys.platform.startswith("linux"):
+        # not QDesktopServices: on Wayland Qt goes through the OpenURI portal and passes this
+        # toast (a layer surface, closing right away) as the parent window; the GNOME portal
+        # can't attach its "Open with" dialog to it and the dialog stops taking clicks.
+        # xdg-open starts the default app directly
+        subprocess.Popen(["xdg-open", str(path)], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
@@ -77,6 +85,14 @@ class ToastCard(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
         self.resize(W, H)
+        # Wayland ignores move(): a plain window would be tiled by the compositor (niri makes
+        # it a half-screen column). A corner-anchored layer surface placed by margins instead
+        self.layer = None
+        if sys.platform.startswith("linux"):
+            from . import layershell
+            if layershell.available():
+                self.layer = layershell.LayerWindow(
+                    self, anchors=layershell.ANCHOR_BOTTOM | layershell.ANCHOR_RIGHT, zone=0)
         self.state = "working"     # working | done | error | info
         self.title = ""
         self.detail = ""
@@ -135,8 +151,16 @@ class ToastCard(QWidget):
         self.setWindowOpacity(self._fade)
         self.update()
 
+    def _place(self, rect: QRect):
+        if self.layer:
+            g = self.stack._screen_rect()
+            self.layer.set_margins(right=g.right() - rect.right(), bottom=g.bottom() - rect.bottom())
+            self.resize(W, H)
+        else:
+            self.setGeometry(rect)
+
     def appear(self, rect: QRect):
-        self.setGeometry(rect)
+        self._place(rect)
         glass.apply_shape(self, glass.rounded_rect_path(QRectF(0, 0, W, H), 20))
         self.liquid.capture_at(rect)
         self.setWindowOpacity(0.0)
@@ -145,9 +169,9 @@ class ToastCard(QWidget):
         self.fade.start()
 
     def relocate(self, rect: QRect):
-        if rect == self.geometry():
+        if rect == self.geometry() and not self.layer:
             return
-        self.setGeometry(rect)
+        self._place(rect)
         if self.liquid.excluded:
             self.liquid.refresh()
         else:

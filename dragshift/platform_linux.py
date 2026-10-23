@@ -4,8 +4,8 @@
   No extra packages or permissions needed (plain libX11 via ctypes).
 * Compositing: XFCE often runs without a compositor (xfwm4 compositing off, or slow GPUs).
   Then translucent windows would show black corners, so callers shape windows with masks.
-* Wayland sessions don't expose global input state, so the Shift trigger is unavailable
-  there; right-click → Open With DragShift still works.
+* Wayland sessions don't expose global input state through X11: the trigger there comes
+  from platform_wayland (evdev) and the menu from layershell.py.
 * Start at login: ~/.config/autostart/dragshift.desktop
 """
 from __future__ import annotations
